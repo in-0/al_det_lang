@@ -21,6 +21,8 @@ from mmdet.utils import (collect_env, get_device, get_root_logger,
                          replace_cfg_vals, rfnext_init_model,
                          setup_multi_processes, update_data_root)
 
+from active_dataset import get_X_L_0
+
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Train a detector')
@@ -199,6 +201,12 @@ def main():
     logger.info(f'Config:\n{cfg.pretty_text}')
 
     cfg.device = get_device()
+    X_all, X_L_0_inds, X_U_0_inds = get_X_L_0(cfg)
+    '''
+    Sorting_X_all: (lsit[dict]) sorting annotations of each images
+    X_L_0_inds: (list[int])
+    X_U_0_inds: (list[int])
+    '''
 
     for cycle in range(cfg.cycles):
         # set random seeds
