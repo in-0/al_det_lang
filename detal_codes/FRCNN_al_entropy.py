@@ -5,4 +5,8 @@ _base_ = [
 ]
 
 cycles = 5
-acquisition_function = 'entropy'
+acquisition_function = 'random'
+
+# Dataset configs
+X_L_0_ratio = 0.2
+buget_ratio = 0.05

@@ -14,12 +14,15 @@ from mmcv.runner import get_dist_info, init_dist
 from mmcv.utils import get_git_hash
 
 from mmdet import __version__
-from mmdet.apis import init_random_seed, set_random_seed, train_detector
-from mmdet.datasets import build_dataset
+from mmdet.apis import init_random_seed, set_random_seed, train_detector, multi_gpu_test
+from mmdet.datasets import build_dataset, build_dataloader
 from mmdet.models import build_detector
 from mmdet.utils import (collect_env, get_device, get_root_logger,
                          replace_cfg_vals, rfnext_init_model,
                          setup_multi_processes, update_data_root)
+
+from active_dataset import get_X_L_0, update_X_L
+from acquisition_fuction import acquire_random
 
 
 def parse_args():
@@ -90,6 +93,14 @@ def parse_args():
         '--auto-scale-lr',
         action='store_true',
         help='enable automatically scaling LR.')
+    parser.add_argument(
+        '--gpu-collect',
+        action='store_true',
+        help='whether to use gpu to collect results.')
+    parser.add_argument(
+        '--tmpdir',
+        help='tmp directory used for collecting results from multiple '
+        'workers, available when gpu-collect is not specified')
     args = parser.parse_args()
     if 'LOCAL_RANK' not in os.environ:
         os.environ['LOCAL_RANK'] = str(args.local_rank)
@@ -199,8 +210,40 @@ def main():
     logger.info(f'Config:\n{cfg.pretty_text}')
 
     cfg.device = get_device()
+    cfg_l, cfg_u = get_X_L_0(cfg)
+    # import pdb;pdb.set_trace()
+    '''
+    cfg_l: select X_L in train.ann_file
+    cfg_u: select X_U in train.ann_file
+    '''
 
     for cycle in range(cfg.cycles):
+        cfg.work_dir = osp.join(cfg.work_dir, f'cycle_{cycle}')
+        # create work_dir
+        mmcv.mkdir_or_exist(osp.abspath(cfg.work_dir))
+        # dump config
+        cfg.dump(osp.join(cfg.work_dir, osp.basename(args.config)))
+        # init the logger before other steps
+        timestamp = time.strftime('%Y%m%d_%H%M%S', time.localtime())
+        log_file = osp.join(cfg.work_dir, f'{timestamp}.log')
+        logger = get_root_logger(log_file=log_file, log_level=cfg.log_level)
+
+        # init the meta dict to record some important information such as
+        # environment info and seed, which will be logged
+        meta = dict()
+        # log env info
+        env_info_dict = collect_env()
+        env_info = '\n'.join([(f'{k}: {v}') for k, v in env_info_dict.items()])
+        dash_line = '-' * 60 + '\n'
+        logger.info('Environment info:\n' + dash_line + env_info + '\n' +
+                    dash_line)
+        meta['env_info'] = env_info
+        meta['config'] = cfg.pretty_text
+        # log some basic info
+        logger.info(f'Distributed training: {distributed}')
+        logger.info(f'Config:\n{cfg.pretty_text}')
+
+        cfg.device = get_device()
         # set random seeds
         seed = init_random_seed(args.seed, device=cfg.device)
         seed = seed + dist.get_rank() if args.diff_seed else seed
@@ -211,8 +254,6 @@ def main():
         meta['seed'] = seed
         meta['exp_name'] = osp.basename(args.config)
 
-        # if cycle == 0:
-
         # init model
         model = build_detector(
             cfg.model,
@@ -220,29 +261,55 @@ def main():
             test_cfg=cfg.get('test_cfg'))
         model.init_weights()
 
-        datasets = [build_dataset(cfg.data.train)]
-        if len(cfg.workflow) == 2:
-            assert 'val' in [mode for (mode, _) in cfg.workflow]
-            val_dataset = copy.deepcopy(cfg.data.val)
-            val_dataset.pipeline = cfg.data.train.get(
-                'pipeline', cfg.data.train.dataset.get('pipeline'))
-            datasets.append(build_dataset(val_dataset))
-        if cfg.checkpoint_config is not None:
+        datasets_l = [build_dataset(cfg_l.data.train)]
+        datasets_u = [build_dataset(cfg_u.data.train)]
+        if len(cfg_l.workflow) == 2:
+            assert 'val' in [mode for (mode, _) in cfg_l.workflow]
+            val_dataset = copy.deepcopy(cfg_l.data.val)
+            val_dataset.pipeline = cfg_l.data.train.get(
+                'pipeline', cfg_l.data.train.dataset.get('pipeline'))
+            datasets_l.append(build_dataset(val_dataset))
+        if cfg_l.checkpoint_config is not None:
             # save mmdet version, config file content and class names in
             # checkpoints as meta data
-            cfg.checkpoint_config.meta = dict(
+            cfg_l.checkpoint_config.meta = dict(
                 mmdet_version=__version__ + get_git_hash()[:7],
-                CLASSES=datasets[0].CLASSES)
+                CLASSES=datasets_l[0].CLASSES)
         # add an attribute for visualization convenience
-        model.CLASSES = datasets[0].CLASSES
+        model.CLASSES = datasets_l[0].CLASSES
         train_detector(
             model,
-            datasets,
+            datasets_l,
             cfg,
             distributed=distributed,
             validate=(not args.no_validate),
             timestamp=timestamp,
             meta=meta)
+
+        # update X_L and X_U for next cycle
+        # Obtain the model output and confidence score
+        # outputs have (1) model output(logit) (2) confidence score (3) feature
+        test_loader_default_args = dict(
+            samples_per_gpu=2, workers_per_gpu=2, dist=distributed, shuffle=False)
+        test_loader_cfg = {
+            **test_loader_default_args,
+            **cfg.data.get('test_dataloader', {})
+        }
+        dataloader_l = [build_dataloader(ds, **test_loader_cfg) for ds in datasets_l]
+        dataloader_u = [build_dataloader(ds, **test_loader_cfg) for ds in datasets_u]
+        output_l = multi_gpu_test(
+            model, dataloader_l, args.tmpdir, args.gpu_collect 
+            or cfg_l.evaluation.get('gpu_collect', False))
+        output_u = multi_gpu_test(
+            model, dataloader_u, args.tmpdir, args.gpu_collect
+            or cfg_u.evaluation.get('gpu_collect', False))
+
+        # Calculate the acquisition function for X_L and X_U
+        if cfg.acquisition_fuction == 'random':
+            new_budget_img_list = acquire_random(cfg, cfg_u)
+        
+        # Update X_L and X_U
+        cfg_l, cfg_u = update_X_L(cfg_l, cfg_u, new_budget_img_list, cycle)
 
 
 if __name__ == '__main__':
