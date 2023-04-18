@@ -262,7 +262,9 @@ def main():
         model.init_weights()
 
         datasets_l = [build_dataset(cfg_l.data.train)]
-        datasets_u = [build_dataset(cfg_u.data.train)]
+        # import pdb;pdb.set_trace()
+        # time.sleep(2)
+        # datasets_u = [build_dataset(cfg_u.data.train)]
         if len(cfg_l.workflow) == 2:
             assert 'val' in [mode for (mode, _) in cfg_l.workflow]
             val_dataset = copy.deepcopy(cfg_l.data.val)
@@ -276,6 +278,7 @@ def main():
                 mmdet_version=__version__ + get_git_hash()[:7],
                 CLASSES=datasets_l[0].CLASSES)
         # add an attribute for visualization convenience
+        time.sleep(2)
         model.CLASSES = datasets_l[0].CLASSES
         train_detector(
             model,
@@ -295,6 +298,7 @@ def main():
             **test_loader_default_args,
             **cfg.data.get('test_dataloader', {})
         }
+        datasets_u = [build_dataset(cfg_u.data.train)]
         dataloader_l = [build_dataloader(ds, **test_loader_cfg) for ds in datasets_l]
         dataloader_u = [build_dataloader(ds, **test_loader_cfg) for ds in datasets_u]
         output_l = multi_gpu_test(
